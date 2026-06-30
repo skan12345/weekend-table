@@ -30,7 +30,7 @@ export function parseMapsUrl(url) {
   const idM = url.match(/!16s(%2F[^!?]+)/);
   if (!nameM && !c) return null;
   return {
-    name: nameM ? decodeURIComponent(nameM[1].replace(/\+/g, " ")) : "",
+    name: nameM ? decodeURIComponent(nameM[1].replace(/\+/g, " ")).split(",")[0].trim() : "",
     lat: c ? parseFloat(c[1]) : null,
     lng: c ? parseFloat(c[2]) : null,
     googleId: idM ? decodeURIComponent(idM[1]) : null,
