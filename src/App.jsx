@@ -418,7 +418,10 @@ function PlaceForm({ initial, settings, initialLink, onClose, onSave }) {
     }
   };
 
-  const handleLink = async (value) => {
+  const handleLink = async (raw) => {
+    // Android's "Share" copies "Name / Address / URL" as one blob — pull out the URL.
+    const link = firstUrl(raw);
+    const value = link || raw;
     setUrl(value);
     const v = value.trim();
     if (!v) { setHint(null); setCoords(null); return; }
@@ -571,7 +574,8 @@ function SettingsSheet({ settings, onChange, onClose }) {
     setHint({ type: "ok", text: `Home set${label ? ` near ${label}` : ""}. Distances now use this point.` });
   };
 
-  const handleHome = async (value) => {
+  const handleHome = async (raw) => {
+    const value = firstUrl(raw) || raw;
     setHomeUrl(value);
     const v = value.trim();
     if (!v) { setHint(null); return; }
