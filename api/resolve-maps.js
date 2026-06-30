@@ -1,98 +1,71 @@
-// Vercel serverless function: POST { url } -> resolves a short Google Maps
-// link by following its redirect (which a browser can't do), then parses the
-// full URL. CORS doesn't apply here, so short links finally work.
+// Vercel serverless function: POST { url } -> structured place data, using
+// Google's OFFICIAL Maps Tools Resolution API + Places Details. No HTML
+// scraping: ToS-compliant, and immune to the consent/redirect walls that block
+// server-side redirect-following.
 //
-// Google returns more than one URL shape for the same short link:
-//   A) /place/Name/@lat,lng/...!3d<lat>!4d<lng>   -> name + coordinates
-//   B) /place/Name,+Full+Address/data=...         -> name+address, NO coordinates
-// This handles both: it splits the name off the address, and when a URL has no
-// coordinates (shape B) it forward-geocodes the address to recover them.
+// Flow:
+//   1. resolveMapsUrls(url)      -> Place ID   (accepts maps.app.goo.gl short links)
+//   2. Places Details(placeId)   -> name, address, coordinates, phone
 //
-// Set GOOGLE_MAPS_API_KEY in Vercel for the address/forward-geocode features.
+// Requires GOOGLE_MAPS_API_KEY, with these APIs enabled on the key:
+//   - Maps Tools API     (mapstools.googleapis.com)
+//   - Places API (New)   (places.googleapis.com)
 
-function splitPlaceSegment(url) {
-  const m = url.match(/\/place\/([^/@]+)/);
-  if (!m) return { name: "", addressText: "" };
-  const full = decodeURIComponent(m[1].replace(/\+/g, " ")).trim();
-  const i = full.indexOf(",");
-  return i >= 0
-    ? { name: full.slice(0, i).trim(), addressText: full.slice(i + 1).trim() }
-    : { name: full, addressText: "" };
+const RESOLVE_ENDPOINT = "https://mapstools.googleapis.com/v1alpha:resolveMapsUrls";
+const PLACES_BASE = "https://places.googleapis.com/v1/";
+
+async function urlToPlaceId(url, key) {
+  const r = await fetch(RESOLVE_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Goog-Api-Key": key },
+    body: JSON.stringify({ urls: [url] }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j?.error?.message || `resolveMapsUrls ${r.status}`);
+  // Batch response: entities[i] is {} when item i failed to resolve.
+  return j?.entities?.[0]?.place || null; // e.g. "places/ChIJ..."
 }
 
-function parseCoords(url) {
-  const pin = url.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/); // real marker
-  const view = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);    // viewport fallback
-  const c = pin || view;
-  return c ? { lat: parseFloat(c[1]), lng: parseFloat(c[2]) } : { lat: null, lng: null };
-}
-
-function parseGoogleId(url) {
-  const m = url.match(/!16s(%2F[^!?]+)/);
-  return m ? decodeURIComponent(m[1]) : null;
-}
-
-async function reverseGeocode(lat, lng, key) {
-  try {
-    const u = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&key=${key}`;
-    const j = await (await fetch(u)).json();
-    return j.results?.[0]?.formatted_address || "";
-  } catch {
-    return "";
-  }
-}
-
-async function forwardGeocode(addressText, key) {
-  try {
-    const u = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(addressText)}&key=${key}`;
-    const j = await (await fetch(u)).json();
-    const res = j.results?.[0];
-    if (!res) return null;
-    return {
-      lat: res.geometry?.location?.lat ?? null,
-      lng: res.geometry?.location?.lng ?? null,
-      address: res.formatted_address || "",
-    };
-  } catch {
-    return null;
-  }
+async function placeDetails(placeResource, key) {
+  const r = await fetch(`${PLACES_BASE}${placeResource}`, {
+    headers: {
+      "X-Goog-Api-Key": key,
+      "X-Goog-FieldMask": "id,displayName,formattedAddress,location,nationalPhoneNumber",
+    },
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j?.error?.message || `places details ${r.status}`);
+  return {
+    name: j?.displayName?.text || "",
+    address: j?.formattedAddress || "",
+    lat: j?.location?.latitude ?? null,
+    lng: j?.location?.longitude ?? null,
+    phone: j?.nationalPhoneNumber || "",
+    googleId: j?.id || placeResource,
+  };
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    res.status(405).json({ error: "POST only" });
-    return;
-  }
+  if (req.method !== "POST") { res.status(405).json({ error: "POST only" }); return; }
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const { url } = body;
     if (!url) { res.status(400).json({ error: "url required" }); return; }
 
-    // Follow redirects to the canonical Maps URL.
-    const r = await fetch(url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0" } });
-    const longUrl = r.url;
-
-    const { name, addressText } = splitPlaceSegment(longUrl);
-    let { lat, lng } = parseCoords(longUrl);
-    const googleId = parseGoogleId(longUrl);
-    let address = "";
-
     const key = process.env.GOOGLE_MAPS_API_KEY;
-    if (key) {
-      if (lat != null) {
-        // Shape A: have coordinates -> reverse-geocode for a clean street address.
-        address = await reverseGeocode(lat, lng, key);
-      } else if (addressText) {
-        // Shape B: no coordinates -> forward-geocode the address to recover them.
-        const g = await forwardGeocode(addressText, key);
-        if (g) { lat = g.lat; lng = g.lng; address = g.address; }
-      }
-    } else if (addressText) {
-      // No key: at least surface the address text we already have from the URL.
-      address = addressText;
+    if (!key) {
+      res.status(200).json({ name: "", lat: null, lng: null, address: "", phone: "", error: "GOOGLE_MAPS_API_KEY not set" });
+      return;
     }
 
-    res.status(200).json({ longUrl, name, lat, lng, googleId, address, phone: "" });
+    const place = await urlToPlaceId(url, key);
+    if (!place) {
+      res.status(200).json({ name: "", lat: null, lng: null, address: "", phone: "", error: "unresolved" });
+      return;
+    }
+
+    const details = await placeDetails(place, key);
+    res.status(200).json({ longUrl: url, ...details });
   } catch (e) {
     res.status(500).json({ error: String(e && e.message ? e.message : e) });
   }
